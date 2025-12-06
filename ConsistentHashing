@@ -1,0 +1,205 @@
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class ConsistentHashing {
+
+  private ConcurrentNavigableMap<Long, Item> hashRing = new ConcurrentSkipListMap<>();
+  private ConcurrentMap<User, Long> userHashes = new ConcurrentHashMap<>();
+  private ReadWriteLock lock = new ReentrantReadWriteLock();
+  private int numOfVirtualNodes = 10;
+
+  //add server or user to the ring
+  public void add(Item item) {
+
+    lock.writeLock().lock();
+
+    try{
+      
+      if (item instanceof Server)
+        //add virtual nodes for servers
+        for (int i = 0; i < numOfVirtualNodes; i++) {
+            Server server = (Server)item;
+            String virtualId = server.getServerId() + "#" + i;
+            Server virtualServer = new Server(virtualId, server.getServerName(), server.getServerAddress(), server.getServerPort());
+            hashRing.put(generateHash(virtualServer), virtualServer);
+        }
+      else
+        hashRing.put(generateHash(item), item);
+      
+    } finally {
+      
+      lock.writeLock().unlock();
+    }
+    
+  }
+
+  //generate hash
+  public Long generateHash(Item item) {
+
+    try {
+      
+      if (item instanceof Server) {
+        Server server = (Server)item;
+        return generateHashImpl("" + server.getServerId() + server.getServerName() + server.getServerAddress() + server.getServerPort());
+      } else {
+        return generateHashImpl("" + ((User)item).getUserId() + ((User)item).getUserName());
+      }
+      
+    } catch (NoSuchAlgorithmException e) {
+      e.printStackTrace();
+    }
+
+    return null;
+  }
+
+  private Long generateHashImpl(String str) throws NoSuchAlgorithmException {
+      MessageDigest md = MessageDigest.getInstance("MD5");
+      byte[] digest = md.digest(str.getBytes(StandardCharsets.UTF_8));
+
+      // Convert the first 8 bytes of the digest into a long
+      ByteBuffer buffer = ByteBuffer.wrap(digest);
+      long hash = buffer.getLong();
+
+      // Ensure it's positive (hash rings typically use positive values)
+      hash = hash & 0x7fffffffffffffffL;
+
+      // Optional: ensure uniqueness in hash ring by rehashing if needed
+      while (hashRing.containsKey(hash)) {
+          str = str + UUID.randomUUID().toString();
+          digest = md.digest(str.getBytes(StandardCharsets.UTF_8));
+          buffer = ByteBuffer.wrap(digest);
+          hash = buffer.getLong() & 0x7fffffffffffffffL;
+      }
+
+      return hash;
+  }
+
+  //get server id to process the request of the user
+  public String getServerId(User user) {
+
+    lock.readLock().lock();
+
+    try {
+        Long hash = userHashes.computeIfAbsent(user, u -> generateHash(user));
+
+        //if the user does not exist in the ring, add it
+        if (!hashRing.containsKey(hash))
+          add(user);
+
+        //get hash for customerId and find the server that should handle it
+        Server server = getServerIdImpl(hash);
+
+        if (server == null) {
+          //what to do if no server is found
+          return null;
+        }
+
+        return server.getServerId();
+    } finally {
+      lock.readLock().unlock();
+    }
+    
+  }
+
+  //get server id to process the request of the user
+  private Server getServerIdImpl(Long hash) {
+    
+    Map.Entry<Long, Item> serverEntry = hashRing.ceilingEntry(hash);
+    if (serverEntry == null) {
+      serverEntry = hashRing.firstEntry(); //wrap to the first 1 in the ring
+    }
+    return (Server)serverEntry.getValue();
+  }
+
+  public class Server extends Item {
+    private String serverId;
+    private String serverName;
+    private String serverAddress;
+    private int serverPort;
+  
+    public Server(String serverId, String serverName, String serverAddress, int serverPort) {
+        this.serverId = serverId;
+        this.serverName = serverName;
+        this.serverAddress = serverAddress;
+        this.serverPort = serverPort;
+    }
+
+    public String getServerId() {
+        return serverId;
+    }
+
+    public String getServerName() {
+          return serverName;
+    }
+    
+    public String getServerAddress() {
+        return serverAddress;
+    }
+  
+    public int getServerPort(){
+        return serverPort;
+    }        
+
+    public void setServerId(String serverId) {
+      this.serverId = serverId;
+    }
+
+    public int hashCode() {
+      return serverId.hashCode() + serverName.hashCode() + serverAddress.hashCode() + serverPort;
+    }
+
+    public boolean equals(Object obj) {
+      if (obj instanceof Server) {
+        Server other = (Server) obj;
+        return serverId.equals(other.serverId) && serverName.equals(other.serverName) && serverAddress.equals(other.serverAddress) && serverPort == other.serverPort;
+      } else
+        return false;
+    }
+      
+  }
+
+  public class User extends Item {
+    private String userId;
+    private String userName;
+  
+    public User(String userId, String userName) {
+        this.userId = userId;
+        this.userName = userName;
+    }
+
+    public String getUserId() {
+      return userId;
+    }
+
+    public String getUserName() {
+      return userName;
+    }
+
+    public int hashCode() {
+      return userId.hashCode() + userName.hashCode();
+    }
+
+    public boolean equals(Object obj) {
+      if (obj instanceof User) {
+        User other = (User) obj;
+        return userId.equals(other.userId) && userName.equals(other.userName);
+      } else {
+        return false;
+      }
+    }
+  }
+
+  public abstract class Item {
+    
+  }
+}
